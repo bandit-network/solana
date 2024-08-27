@@ -2,11 +2,15 @@ use {
     super::Bank,
     log::{debug, warn},
     solana_sdk::{
-        account::{ ReadableAccount, WritableAccount}, pubkey::Pubkey, reward_info::RewardInfo, reward_type::RewardType, system_program
+        account::{ReadableAccount, WritableAccount},
+        pubkey::Pubkey,
+        reward_info::RewardInfo,
+        reward_type::RewardType,
+        system_program,
     },
     solana_svm::account_rent_state::RentState,
     solana_vote::vote_account::VoteAccountsHashMap,
-    std::{result::Result, sync::atomic::Ordering::Relaxed},
+    std::{result::Result, str::FromStr, sync::atomic::Ordering::Relaxed},
     thiserror::Error,
 };
 
@@ -104,12 +108,7 @@ impl Bank {
             if reward > 0 {
                 // TODO: REPLACE WITH VALID PUBKEY
                 // let reward_pool = Pubkey::from([0; 32]);
-                let reward_pool = Pubkey::new_from_array([
-                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-                ]);
+                let reward_pool = Pubkey::from_str("DzdL7Hza728yFcgjmdmhJvga861MgCoadSCxc1BqgYqH").unwrap();
 
                 match self.deposit_rewards(
                     &reward_pool,
@@ -117,7 +116,7 @@ impl Bank {
                     RewardOptions {
                         check_account_owner: validate_fee_collector,
                         check_rent_paying: validate_fee_collector,
-                    }
+                    },
                 ) {
                     Ok(post_balance) => {
                         self.rewards.write().unwrap().push((
@@ -189,7 +188,7 @@ impl Bank {
         if options.check_account_owner && !system_program::check_id(account.owner()) {
             return Err(RewardFeeError::InvalidAccountOwner);
         }
-        
+
         let rent = &self.rent_collector().rent;
         let recipient_pre_rent_state = RentState::from_account(&account, rent);
         let distribution = account.checked_add_lamports(fees);
@@ -385,7 +384,7 @@ pub mod tests {
         solana_sdk::{
             account::AccountSharedData, feature_set, native_token::sol_to_lamports, pubkey,
             rent::Rent, signature::Signer,
-        },
+        }, std::str::FromStr,
     };
 
     #[test]
@@ -412,12 +411,7 @@ pub mod tests {
             }
         }
 
-        let reward_pool = Pubkey::new_from_array([
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-        ]);
+        let reward_pool = Pubkey::from_str("DzdL7Hza728yFcgjmdmhJvga861MgCoadSCxc1BqgYqH").unwrap();
 
         for test_case in [
             TestCase::new(Scenario::Normal, false),
@@ -455,8 +449,11 @@ pub mod tests {
 
             let (actual_collected_fees, reward_amount) =
                 bank.fee_rate_governor.reward(expected_collected_fees);
-            
-            println!("DEPOSIT: {} | REWARD: {} | BURN: {}", actual_collected_fees, reward_amount, burn_amount);
+
+            println!(
+                "DEPOSIT: {} | REWARD: {} | BURN: {}",
+                actual_collected_fees, reward_amount, burn_amount
+            );
 
             assert!(burn_amount > 0);
             assert!(reward_amount > 0);
@@ -480,7 +477,6 @@ pub mod tests {
                 let reward_account =
                     AccountSharedData::new(min_rent_exempt_balance, 0, &Pubkey::new_unique());
                 bank.store_account(&reward_pool, &reward_account);
-
             } else {
                 let account =
                     AccountSharedData::new(min_rent_exempt_balance, 0, &system_program::id());
@@ -509,7 +505,6 @@ pub mod tests {
                     "There should be no rewards distributed"
                 );
             } else {
-
                 let validator_balance = bank.get_balance(&bank.collector_id);
                 println!("VALIDATOR BALANCE: {}", validator_balance);
 
@@ -613,13 +608,11 @@ pub mod tests {
         let account = AccountSharedData::new(u64::MAX, 0, &system_program::id());
         bank.store_account(bank.collector_id(), &account);
         let reward_pool = Pubkey::new_from_array([
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0xc1, 0x0f, 0x6d, 0x55, 0x34, 0x60, 0x81, 0xec, 0xf6, 0x7f, 0x15, 0xaa, 0xb3, 0x20,
+            0x82, 0x99, 0x00, 0x0b, 0x4d, 0x34, 0x78, 0x08, 0x35, 0xa4, 0x27, 0xe3, 0x63, 0xd1,
+            0x4d, 0x52, 0x22, 0x24,
         ]);
-        let reward_account =
-            AccountSharedData::new(u64::MAX, 0, &system_program::id());
+        let reward_account = AccountSharedData::new(u64::MAX, 0, &system_program::id());
         bank.store_account(&reward_pool, &reward_account);
 
         let initial_capitalization = bank.capitalization();
