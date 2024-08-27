@@ -99,6 +99,7 @@ impl From<Reward> for generated::Reward {
                 Some(RewardType::Rent) => generated::RewardType::Rent,
                 Some(RewardType::Staking) => generated::RewardType::Staking,
                 Some(RewardType::Voting) => generated::RewardType::Voting,
+                Some(RewardType::Transacting) => generated::RewardType::Transacting,
             } as i32,
             commission: reward.commission.map(|c| c.to_string()).unwrap_or_default(),
         }

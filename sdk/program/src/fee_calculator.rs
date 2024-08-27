@@ -178,6 +178,12 @@ impl FeeRateGovernor {
         (fees - burned, burned)
     }
 
+    /// calculate reward fee from a deposit, returns (deposit, reward)
+    pub fn reward(&self, deposit: u64) -> (u64, u64) {
+        let reward = deposit / 2;
+        (deposit - reward, reward)
+    }
+
     /// create a FeeCalculator based on current cluster signature throughput
     pub fn create_fee_calculator(&self) -> FeeCalculator {
         FeeCalculator::new(self.lamports_per_signature)
@@ -201,6 +207,9 @@ mod tests {
 
         fee_rate_governor.burn_percent = 100;
         assert_eq!(fee_rate_governor.burn(2), (0, 2));
+
+        fee_rate_governor.burn_percent = 25;
+        assert_eq!(fee_rate_governor.burn(100), (75, 25));
     }
 
     #[test]

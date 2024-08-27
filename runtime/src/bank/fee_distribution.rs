@@ -2,11 +2,7 @@ use {
     super::Bank,
     log::{debug, warn},
     solana_sdk::{
-        account::{ReadableAccount, WritableAccount},
-        pubkey::Pubkey,
-        reward_info::RewardInfo,
-        reward_type::RewardType,
-        system_program,
+        account::{ ReadableAccount, WritableAccount}, pubkey::Pubkey, reward_info::RewardInfo, reward_type::RewardType, system_program
     },
     solana_svm::account_rent_state::RentState,
     solana_vote::vote_account::VoteAccountsHashMap,
@@ -20,8 +16,24 @@ struct DepositFeeOptions {
     check_rent_paying: bool,
 }
 
+#[derive(Debug)]
+struct RewardOptions {
+    check_account_owner: bool,
+    check_rent_paying: bool,
+}
+
 #[derive(Error, Debug, PartialEq)]
 enum DepositFeeError {
+    #[error("fee account became rent paying")]
+    InvalidRentPayingAccount,
+    #[error("lamport overflow")]
+    LamportOverflow,
+    #[error("invalid fee account owner")]
+    InvalidAccountOwner,
+}
+
+#[derive(Error, Debug, PartialEq)]
+enum RewardFeeError {
     #[error("fee account became rent paying")]
     InvalidRentPayingAccount,
     #[error("lamport overflow")]
@@ -49,8 +61,11 @@ impl Bank {
         let collector_fees = self.collector_fees.load(Relaxed);
         if collector_fees != 0 {
             let (deposit, mut burn) = self.fee_rate_governor.burn(collector_fees);
+
+            let (deposit, reward) = self.fee_rate_governor.reward(deposit);
+
+            let validate_fee_collector = self.validate_fee_collector_account();
             if deposit > 0 {
-                let validate_fee_collector = self.validate_fee_collector_account();
                 match self.deposit_fees(
                     &self.collector_id,
                     deposit,
@@ -81,7 +96,45 @@ impl Bank {
                             ("num_lamports", deposit, i64),
                             ("error", err.to_string(), String),
                         );
-                        burn += deposit;
+                        burn += deposit + reward;
+                    }
+                }
+            }
+
+            if reward > 0 {
+                // TODO: REPLACE WITH VALID PUBKEY
+                // let reward_pool = Pubkey::from([0; 32]);
+                let reward_pool = Pubkey::new_from_array([
+                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                ]);
+
+                match self.deposit_rewards(
+                    &reward_pool,
+                    reward,
+                    RewardOptions {
+                        check_account_owner: validate_fee_collector,
+                        check_rent_paying: validate_fee_collector,
+                    }
+                ) {
+                    Ok(post_balance) => {
+                        self.rewards.write().unwrap().push((
+                            reward_pool,
+                            RewardInfo {
+                                reward_type: RewardType::Transacting,
+                                lamports: reward as i64,
+                                post_balance,
+                                commission: None,
+                            },
+                        ));
+                    }
+                    Err(err) => {
+                        debug!(
+                            "Failed to distribute slashed fee of {} lamports to {} due to {}. Amount will be burned instead.",
+                            reward, reward_pool, err
+                        );
                     }
                 }
             }
@@ -96,6 +149,7 @@ impl Bank {
         fees: u64,
         options: DepositFeeOptions,
     ) -> Result<u64, DepositFeeError> {
+        println!("DEPOSITED({:?}): {}", pubkey, fees);
         let mut account = self.get_account_with_fixed_root(pubkey).unwrap_or_default();
 
         if options.check_account_owner && !system_program::check_id(account.owner()) {
@@ -114,6 +168,40 @@ impl Bank {
                 recipient_post_rent_state.transition_allowed_from(&recipient_pre_rent_state);
             if !rent_state_transition_allowed {
                 return Err(DepositFeeError::InvalidRentPayingAccount);
+            }
+        }
+
+        self.store_account(pubkey, &account);
+        Ok(account.lamports())
+    }
+
+    // Deposits fees into a specified account and if successful, returns the new balance of that account
+    fn deposit_rewards(
+        &self,
+        pubkey: &Pubkey,
+        fees: u64,
+        options: RewardOptions,
+    ) -> Result<u64, RewardFeeError> {
+        println!("REWARDED({:?}): {}", pubkey, fees);
+        let mut account = self.get_account_with_fixed_root(pubkey).unwrap_or_default();
+
+        // TODO: ADD PROPER ACCOUNT OWNER
+        if options.check_account_owner && !system_program::check_id(account.owner()) {
+            return Err(RewardFeeError::InvalidAccountOwner);
+        }
+        
+        let rent = &self.rent_collector().rent;
+        let recipient_pre_rent_state = RentState::from_account(&account, rent);
+        let distribution = account.checked_add_lamports(fees);
+        if distribution.is_err() {
+            return Err(RewardFeeError::LamportOverflow);
+        }
+        if options.check_rent_paying {
+            let recipient_post_rent_state = RentState::from_account(&account, rent);
+            let rent_state_transition_allowed =
+                recipient_post_rent_state.transition_allowed_from(&recipient_pre_rent_state);
+            if !rent_state_transition_allowed {
+                return Err(RewardFeeError::InvalidRentPayingAccount);
             }
         }
 
@@ -302,13 +390,14 @@ pub mod tests {
 
     #[test]
     fn test_distribute_transaction_fees() {
-        #[derive(PartialEq)]
+        #[derive(PartialEq, Debug)]
         enum Scenario {
             Normal,
             InvalidOwner,
             RentPaying,
         }
 
+        #[derive(Debug)]
         struct TestCase {
             scenario: Scenario,
             disable_checks: bool,
@@ -323,6 +412,13 @@ pub mod tests {
             }
         }
 
+        let reward_pool = Pubkey::new_from_array([
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+        ]);
+
         for test_case in [
             TestCase::new(Scenario::Normal, false),
             TestCase::new(Scenario::Normal, true),
@@ -331,6 +427,8 @@ pub mod tests {
             TestCase::new(Scenario::RentPaying, false),
             TestCase::new(Scenario::RentPaying, true),
         ] {
+            println!("--------------");
+            println!("{:?}", test_case.scenario);
             let mut genesis = create_genesis_config(0);
             if test_case.disable_checks {
                 genesis
@@ -341,35 +439,62 @@ pub mod tests {
             }
             let rent = Rent::default();
             let min_rent_exempt_balance = rent.minimum_balance(0);
+            println!("MINIMUM RENT EXEMPT BALANCE: {}", min_rent_exempt_balance);
             genesis.genesis_config.rent = rent; // Ensure rent is non-zero, as genesis_utils sets Rent::free by default
             let bank = Bank::new_for_tests(&genesis.genesis_config);
             let transaction_fees = 100;
             bank.collector_fees.fetch_add(transaction_fees, Relaxed);
             assert_eq!(transaction_fees, bank.collector_fees.load(Relaxed));
+            let reward_pool_balance = bank.get_balance(&reward_pool);
+            println!("INITIAL REWARD POOL BALANCE: {}", reward_pool_balance);
+            let validator_balance = bank.get_balance(&bank.collector_id);
+            println!("INITIAL VALIDATOR BALANCE: {}", validator_balance);
+
             let (expected_collected_fees, burn_amount) =
                 bank.fee_rate_governor.burn(transaction_fees);
+
+            let (actual_collected_fees, reward_amount) =
+                bank.fee_rate_governor.reward(expected_collected_fees);
+            
+            println!("DEPOSIT: {} | REWARD: {} | BURN: {}", actual_collected_fees, reward_amount, burn_amount);
+
             assert!(burn_amount > 0);
+            assert!(reward_amount > 0);
 
             if test_case.scenario == Scenario::RentPaying {
                 // ensure that account balance + collected fees will make it rent-paying
                 let initial_balance = 100;
                 let account = AccountSharedData::new(initial_balance, 0, &system_program::id());
                 bank.store_account(bank.collector_id(), &account);
+
+                let reward_account =
+                    AccountSharedData::new(initial_balance, 0, &system_program::id());
+                bank.store_account(&reward_pool, &reward_account);
                 assert!(initial_balance + transaction_fees < min_rent_exempt_balance);
             } else if test_case.scenario == Scenario::InvalidOwner {
                 // ensure that account owner is invalid and fee distribution will fail
                 let account =
                     AccountSharedData::new(min_rent_exempt_balance, 0, &Pubkey::new_unique());
                 bank.store_account(bank.collector_id(), &account);
+
+                let reward_account =
+                    AccountSharedData::new(min_rent_exempt_balance, 0, &Pubkey::new_unique());
+                bank.store_account(&reward_pool, &reward_account);
+
             } else {
                 let account =
                     AccountSharedData::new(min_rent_exempt_balance, 0, &system_program::id());
                 bank.store_account(bank.collector_id(), &account);
+
+                let reward_account =
+                    AccountSharedData::new(min_rent_exempt_balance, 0, &system_program::id());
+                bank.store_account(&reward_pool, &reward_account);
             }
 
             let initial_capitalization = bank.capitalization();
             let initial_collector_id_balance = bank.get_balance(bank.collector_id());
             bank.distribute_transaction_fees();
+            println!("DISTRIBUTE");
             let new_collector_id_balance = bank.get_balance(bank.collector_id());
 
             if test_case.scenario != Scenario::Normal && !test_case.disable_checks {
@@ -384,8 +509,15 @@ pub mod tests {
                     "There should be no rewards distributed"
                 );
             } else {
+
+                let validator_balance = bank.get_balance(&bank.collector_id);
+                println!("VALIDATOR BALANCE: {}", validator_balance);
+
+                let reward_pool_balance = bank.get_balance(&reward_pool);
+                println!("REWARD POOL BALANCE: {}", reward_pool_balance);
+
                 assert_eq!(
-                    initial_collector_id_balance + expected_collected_fees,
+                    initial_collector_id_balance + actual_collected_fees,
                     new_collector_id_balance
                 );
 
@@ -394,18 +526,29 @@ pub mod tests {
                 let locked_rewards = bank.rewards.read().unwrap();
                 assert_eq!(
                     locked_rewards.len(),
-                    1,
-                    "There should be one reward distributed"
+                    2,
+                    "There should be two reward distributed"
                 );
 
-                let reward_info = &locked_rewards[0];
+                let reward_info_fee = &locked_rewards[0];
                 assert_eq!(
-                    reward_info.1.lamports, expected_collected_fees as i64,
+                    reward_info_fee.1.lamports, actual_collected_fees as i64,
                     "The reward amount should match the expected deposit"
                 );
                 assert_eq!(
-                    reward_info.1.reward_type,
+                    reward_info_fee.1.reward_type,
                     RewardType::Fee,
+                    "The reward type should be Fee"
+                );
+
+                let reward_info_transacting = &locked_rewards[1];
+                assert_eq!(
+                    reward_info_transacting.1.lamports, reward_amount as i64,
+                    "The reward amount should match the reward amount"
+                );
+                assert_eq!(
+                    reward_info_transacting.1.reward_type,
+                    RewardType::Transacting,
                     "The reward type should be Fee"
                 );
             }
@@ -469,6 +612,15 @@ pub mod tests {
         // ensure that account balance will overflow and fee distribution will fail
         let account = AccountSharedData::new(u64::MAX, 0, &system_program::id());
         bank.store_account(bank.collector_id(), &account);
+        let reward_pool = Pubkey::new_from_array([
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+        ]);
+        let reward_account =
+            AccountSharedData::new(u64::MAX, 0, &system_program::id());
+        bank.store_account(&reward_pool, &reward_account);
 
         let initial_capitalization = bank.capitalization();
         let initial_collector_id_balance = bank.get_balance(bank.collector_id());
